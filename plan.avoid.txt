@@ -1,0 +1,5 @@
+title=避让测试
+detail=目标在右上角，面板应当换位置
+countdown=5
+move=2380,150,右上角目标
+wait=2500

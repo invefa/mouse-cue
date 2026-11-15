@@ -162,6 +162,7 @@ extern "system" {
     fn GetDC(hwnd: HWND) -> HDC;
     fn ReleaseDC(hwnd: HWND, hdc: HDC) -> i32;
     fn InvalidateRect(hwnd: HWND, rect: *const RECT, erase: i32) -> i32;
+    fn IsWindowVisible(hwnd: HWND) -> i32;
     fn SetWindowRgn(hwnd: HWND, rgn: isize, redraw: i32) -> i32;
     fn SetProcessDPIAware() -> i32;
     fn GetCursorPos(pt: *mut POINT) -> i32;
@@ -198,7 +199,10 @@ extern "system" {
     fn LineTo(hdc: HDC, x: i32, y: i32) -> i32;
     fn RoundRect(hdc: HDC, l: i32, t: i32, r: i32, b: i32, w: i32, h: i32) -> i32;
     fn GetStockObject(index: i32) -> isize;
+    fn GetPixel(hdc: HDC, x: i32, y: i32) -> u32;
+    fn GetWindowRect(hwnd: HWND, rect: *mut RECT) -> i32;
     fn CreateRoundRectRgn(l: i32, t: i32, r: i32, b: i32, w: i32, h: i32) -> isize;
+    fn CreateEllipticRgn(l: i32, t: i32, r: i32, b: i32) -> isize;
 }
 
 const WS_POPUP: u32 = 0x8000_0000;
@@ -242,6 +246,12 @@ const CLR_TEXT: u32 = 0x00E8_E8E8; // #e8e8e8
 const CLR_MUTED: u32 = 0x008C_8C8C; // #8c8c8c
 const CLR_ACCENT: u32 = 0x00DC_DCDC; // #dcdcdc
 const CLR_STOP: u32 = 0x00FF_FFFF; // #ffffff
+// GDI+ 的颜色是 ARGB，alpha 位必须给满，否则整块画不出来
+const A_DISC: u32 = 0xFF6E_6E6E;
+const A_DISC_HOT: u32 = 0xFFA8_A8A8;
+const A_RIM: u32 = 0xFFF2_F2F2;
+const A_SHADOW: u32 = 0xFF18_1818;
+const A_CROSS: u32 = 0xFFF6_F6F6;
 
 #[derive(Clone)]
 enum Step {
@@ -271,6 +281,11 @@ struct State {
     cue: HWND,
     cue_at: (i32, i32),
     cue_pressed: bool,
+    cue_from: f32,
+    cue_to: f32,
+    cue_started: Instant,
+    cue_ms: f32,
+    cue_radius: f32,
     cancel_rect: RECT,
     dpi: f32,
     exit_code: i32,
@@ -455,10 +470,16 @@ fn do_click(x: i32, y: i32, double: bool) {
     }
 }
 
-fn place_cue(x: i32, y: i32) {
+/// 把落点标记放到目标处。animate 为真时从三倍尺寸收缩到定尺。
+fn place_cue(x: i32, y: i32, animate: bool) {
     let state = st();
-    let size = scale(state.dpi, 96);
+    let size = scale(state.dpi, 320);
+    let target = scale(state.dpi, 34) as f32;
     state.cue_at = (x, y);
+    state.cue_to = target;
+    state.cue_from = if animate { target * 3.2 } else { target };
+    state.cue_radius = state.cue_from;
+    state.cue_started = Instant::now();
     unsafe {
         SetWindowPos(
             state.cue,
@@ -470,7 +491,48 @@ fn place_cue(x: i32, y: i32) {
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
     }
+    unsafe {
+        ShowWindow(state.cue, SW_SHOWNOACTIVATE);
+        UpdateWindow(state.cue);
+    }
     invalidate(state.cue);
+    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    unsafe {
+        GetWindowRect(state.cue, &mut wr);
+    }
+    eprintln!(
+        "cue placed ({},{}) size={} visible={} rect=({},{})-({},{}) r={:.1}",
+        x,
+        y,
+        size,
+        unsafe { IsWindowVisible(state.cue) },
+        wr.left,
+        wr.top,
+        wr.right,
+        wr.bottom,
+        state.cue_radius
+    );
+}
+
+/// 推进收缩动画；返回是否仍在动。
+fn step_cue_animation() -> bool {
+    let state = st();
+    let elapsed = Instant::now().saturating_duration_since(state.cue_started).as_secs_f32() * 1000.0;
+    if elapsed >= state.cue_ms {
+        if (state.cue_radius - state.cue_to).abs() > 0.01 {
+            state.cue_radius = state.cue_to;
+            invalidate(state.cue);
+        }
+        return false;
+    }
+    let t = (elapsed / state.cue_ms).clamp(0.0, 1.0);
+    let ease = 1.0 - (1.0 - t).powi(3);
+    let next = state.cue_from + (state.cue_to - state.cue_from) * ease;
+    if (next - state.cue_radius).abs() > 0.4 {
+        state.cue_radius = next;
+        invalidate(state.cue);
+    }
+    true
 }
 
 fn invalidate(hwnd: HWND) {
@@ -701,10 +763,14 @@ fn gp_line(g: isize, x1: f32, y1: f32, x2: f32, y2: f32, width: f32, argb: u32) 
     }
 }
 
-// 落点标记：细线双环 + 四向刻度 + 中心点，按下时收拢为实心点。
+// 落点标记：圆里一个加号。圆用半透明灰填充，轮廓与加号都走双色描边
+// （外深内浅），这样在深色与浅色背景上都能分开，不用逐像素反色。
 fn draw_cue(hwnd: HWND, hdc: HDC) {
     let state = st();
-    let dpi = state.dpi;
+    let radius = state.cue_radius;
+    if radius < 1.0 {
+        return;
+    }
     unsafe {
         let mut client = RECT {
             left: 0,
@@ -722,34 +788,26 @@ fn draw_cue(hwnd: HWND, hdc: HDC) {
         if GdipCreateFromHDC(hdc, &mut g) != 0 {
             return;
         }
-        GdipSetSmoothingMode(g, 4); // SmoothingModeAntiAlias
+        GdipSetSmoothingMode(g, 4);
 
         let cx = (client.right as f32) / 2.0;
         let cy = (client.bottom as f32) / 2.0;
-        let u = dpi;
+        let u = state.dpi;
 
-        if state.cue_pressed {
-            gp_ring(g, cx, cy, 30.0 * u, 1.8 * u, 0xFFFF_FFFF);
-            gp_ring(g, cx, cy, 21.0 * u, 1.0 * u, 0x66FF_FFFF);
-            gp_disc(g, cx, cy, 4.5 * u, 0xFFFF_FFFF);
-        } else {
-            gp_ring(g, cx, cy, 30.0 * u, 1.6 * u, 0xFFDC_DCDC);
-            gp_ring(g, cx, cy, 23.0 * u, 1.0 * u, 0x668C_8C8C);
-            for (dx, dy) in [(0.0f32, -1.0f32), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)] {
-                let inner = 35.0 * u;
-                let outer = 41.0 * u;
-                gp_line(
-                    g,
-                    cx + dx * inner,
-                    cy + dy * inner,
-                    cx + dx * outer,
-                    cy + dy * outer,
-                    1.0 * u,
-                    0x998C_8C8C,
-                );
-            }
-            gp_disc(g, cx, cy, 2.6 * u, 0xFFDC_DCDC);
-        }
+        let fill = if state.cue_pressed { A_DISC_HOT } else { A_DISC };
+        gp_disc(g, cx, cy, radius, fill);
+
+        let rim = (u * 2.0).max(1.6);
+        gp_ring(g, cx, cy, radius - rim / 2.0, rim + u, A_SHADOW);
+        gp_ring(g, cx, cy, radius - rim / 2.0, rim, if state.cue_pressed { 0xFFFF_FFFF } else { A_RIM });
+
+        let arm = (radius * 0.46).max(scale(state.dpi, 6) as f32);
+        let stroke = (u * 2.2).max(1.8);
+        let cross = if state.cue_pressed { 0xFFFF_FFFF } else { A_CROSS };
+        gp_line(g, cx - arm, cy, cx + arm, cy, stroke + u * 1.6, A_SHADOW);
+        gp_line(g, cx, cy - arm, cx, cy + arm, stroke + u * 1.6, A_SHADOW);
+        gp_line(g, cx - arm, cy, cx + arm, cy, stroke, cross);
+        gp_line(g, cx, cy - arm, cx, cy + arm, stroke, cross);
 
         GdipDeleteGraphics(g);
     }
@@ -848,6 +906,7 @@ fn tick() {
             cancel();
         }
     }
+    step_cue_animation();
 
     match state.phase {
         0 => {
@@ -906,7 +965,7 @@ fn run_step() {
                 // 这里仍然把圆环画在目标坐标，用户能看到落点。
                 eprintln!("move delegated: 本进程无输入权限，圆环标记 ({},{})", x, y);
             }
-            place_cue(x, y);
+            place_cue(x, y, true);
             state.step += 1;
             // 让圆环在目标位置停留，既给视觉反馈，也给事件层时间刷新命中目标
             state.wait_until = Some(Instant::now() + Duration::from_millis(260));
@@ -989,7 +1048,7 @@ fn create_window(
         // 黑色作色键透明，四角才不会被矩形窗口吃掉
         if rounded {
             // 圆角靠窗口区域裁剪，背景用实色填充，避免靠色键把面板也挖空
-            SetLayeredWindowAttributes(hwnd, 0x0000_0000, 255, 2);
+            SetLayeredWindowAttributes(hwnd, 0x0000_0000, 236, 2);
             let radius = 20;
             let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius);
             SetWindowRgn(hwnd, rgn, 1);
@@ -1025,16 +1084,34 @@ fn run(plan: Plan, cancel_after: Option<u64>) -> i32 {
         let (sw, sh) = screen_size();
         let w = scale(dpi, 560);
         let h = scale(dpi, 96);
-        let x = (sw - w) / 2;
-        // 浮层避开目标：目标在上半屏就落到屏幕底部，反之留在顶部，
-        // 免得提示面板盖住即将点击的那一块界面。
-        let target_y = plan.steps.iter().find_map(|step| match step {
-            Step::Move { y, .. } => Some(*y),
+        let margin = scale(dpi, 16);
+        let marker = scale(dpi, 120);
+        let target_pt = plan.steps.iter().find_map(|step| match step {
+            Step::Move { x, y, .. } => Some((*x, *y)),
             _ => None,
         });
-        let y = match target_y {
-            Some(ty) if ty < sh / 2 => sh - h - scale(dpi, 84),
-            _ => scale(dpi, 72),
+        // 默认落在右上角；与目标点重叠时依次换到其余候选位置。
+        let candidates = [
+            (sw - w - margin, margin),
+            (margin, margin),
+            (sw - w - margin, sh - h - margin),
+            (margin, sh - h - margin),
+            ((sw - w) / 2, margin),
+            ((sw - w) / 2, sh - h - margin),
+        ];
+        let (x, y) = match target_pt {
+            Some((tx, ty)) => {
+                let mut chosen = candidates[0];
+                for (cx, cy) in candidates {
+                    let overlap = tx + marker > cx && tx - marker < cx + w && ty + marker > cy && ty - marker < cy + h;
+                    if !overlap {
+                        chosen = (cx, cy);
+                        break;
+                    }
+                }
+                chosen
+            }
+            None => candidates[0],
         };
 
         let proc_addr = main_proc as usize;
@@ -1095,6 +1172,11 @@ fn run(plan: Plan, cancel_after: Option<u64>) -> i32 {
             cue,
             cue_at: (0, 0),
             cue_pressed: false,
+            cue_from: 0.0,
+            cue_to: 0.0,
+            cue_started: Instant::now(),
+            cue_ms: 520.0,
+            cue_radius: 0.0,
             cancel_rect,
             dpi,
             exit_code: 0,
@@ -1103,6 +1185,11 @@ fn run(plan: Plan, cancel_after: Option<u64>) -> i32 {
 
         ShowWindow(main, SW_SHOWNOACTIVATE);
         UpdateWindow(main);
+        // 倒计时一开始就把落点标出来，用户才有时间看清要动哪里
+        if let Some((tx, ty)) = target_pt {
+            place_cue(tx, ty, true);
+            move_cursor(tx, ty);
+        }
         SetWindowPos(
             main,
             HWND_TOPMOST,
@@ -1112,7 +1199,7 @@ fn run(plan: Plan, cancel_after: Option<u64>) -> i32 {
             h,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
-        SetTimer(main, 1, 60, 0);
+        SetTimer(main, 1, 16, 0);
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, 0, 0, 0) > 0 {
