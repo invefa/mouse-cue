@@ -247,11 +247,11 @@ const CLR_MUTED: u32 = 0x008C_8C8C; // #8c8c8c
 const CLR_ACCENT: u32 = 0x00DC_DCDC; // #dcdcdc
 const CLR_STOP: u32 = 0x00FF_FFFF; // #ffffff
 // GDI+ 的颜色是 ARGB，alpha 位必须给满，否则整块画不出来
-const A_DISC: u32 = 0xFF6E_6E6E;
+const A_DISC: u32 = 0xFF3E_3E3E;
 const A_DISC_HOT: u32 = 0xFFA8_A8A8;
 const A_RIM: u32 = 0xFFF2_F2F2;
 const A_SHADOW: u32 = 0xFF18_1818;
-const A_CROSS: u32 = 0xFFF6_F6F6;
+const A_CROSS: u32 = 0xFFF8_F8F8;
 
 #[derive(Clone)]
 enum Step {
@@ -827,20 +827,14 @@ fn draw_cue(hwnd: HWND, hdc: HDC) {
         let cy = (client.bottom as f32) / 2.0;
         let u = state.dpi;
 
-        let fill = if state.cue_pressed { A_DISC_HOT } else { A_DISC };
+        let fill = if state.cue_pressed { A_CROSS } else { A_DISC };
         gp_disc(g, cx, cy, radius, fill);
 
-        let rim = (u * 2.0).max(1.6);
-        gp_ring(g, cx, cy, radius - rim / 2.0, rim + u, A_SHADOW);
-        gp_ring(g, cx, cy, radius - rim / 2.0, rim, if state.cue_pressed { 0xFFFF_FFFF } else { A_RIM });
-
         let arm = (radius * 0.46).max(scale(state.dpi, 6) as f32);
-        let stroke = (u * 2.2).max(1.8);
-        let cross = if state.cue_pressed { 0xFFFF_FFFF } else { A_CROSS };
-        gp_line(g, cx - arm, cy, cx + arm, cy, stroke + u * 1.6, A_SHADOW);
-        gp_line(g, cx, cy - arm, cx, cy + arm, stroke + u * 1.6, A_SHADOW);
-        gp_line(g, cx - arm, cy, cx + arm, cy, stroke, cross);
-        gp_line(g, cx, cy - arm, cx, cy + arm, stroke, cross);
+        let cross = if state.cue_pressed { A_DISC } else { A_CROSS };
+        gp_line(g, cx - arm, cy, cx + arm, cy, 1.0, cross);
+        gp_line(g, cx, cy - arm, cx, cy + arm, 1.0, cross);
+
 
         GdipDeleteGraphics(g);
     }

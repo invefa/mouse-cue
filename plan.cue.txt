@@ -1,5 +1,5 @@
-title=反色标记预览
-detail=圆内取屏幕反色，加号再反一次
-countdown=6
-move=1200,760,预览点
-wait=3000
+title=透明标记
+detail=圆用低透明度，加号一像素
+countdown=5
+move=1200,700,测试点
+wait=2000
