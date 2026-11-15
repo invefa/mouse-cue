@@ -1,0 +1,5 @@
+title=浅底采样
+detail=亮背景上取暗图标
+countdown=3
+move=2620,320,浅色壁纸
+wait=2000

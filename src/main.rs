@@ -286,6 +286,8 @@ struct State {
     cue_started: Instant,
     cue_ms: f32,
     cue_radius: f32,
+    disc_color: u32,
+    cross_color: u32,
     cancel_rect: RECT,
     dpi: f32,
     exit_code: i32,
@@ -466,6 +468,37 @@ fn do_click(x: i32, y: i32, double: bool) {
         }
         if double {
             std::thread::sleep(Duration::from_millis(60));
+        }
+    }
+}
+
+/// 采样目标位置的底色，挑一组对比最强的配色：暗底给亮图标，亮底给暗图标。
+fn pick_colors(x: i32, y: i32) -> (u32, u32) {
+    unsafe {
+        let dc = GetDC(0);
+        if dc == 0 {
+            return (0xFF3C_3C3C, 0xFFF4_F4F4);
+        }
+        let samples = [(0, 0), (-7, 0), (7, 0), (0, -7), (0, 7), (-5, -5), (5, 5)];
+        let mut total = 0u32;
+        let mut count = 0u32;
+        for (dx, dy) in samples {
+            let px = GetPixel(dc, x + dx, y + dy);
+            if px == 0xFFFF_FFFF {
+                continue;
+            }
+            let r = px & 0xFF;
+            let g = (px >> 8) & 0xFF;
+            let b = (px >> 16) & 0xFF;
+            total += (r * 299 + g * 587 + b * 114) / 1000;
+            count += 1;
+        }
+        ReleaseDC(0, dc);
+        let lum = if count > 0 { total / count } else { 128 };
+        if lum < 120 {
+            (0xFF3C_3C3C, 0xFFF4_F4F4)
+        } else {
+            (0xFFC6_C6C6, 0xFF14_1414)
         }
     }
 }
@@ -1177,6 +1210,8 @@ fn run(plan: Plan, cancel_after: Option<u64>) -> i32 {
             cue_started: Instant::now(),
             cue_ms: 520.0,
             cue_radius: 0.0,
+            disc_color: 0xFF3C_3C3C,
+            cross_color: 0xFFF4_F4F4,
             cancel_rect,
             dpi,
             exit_code: 0,
