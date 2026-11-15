@@ -1,0 +1,6 @@
+title=打开语料库面板
+detail=点击左侧栏的「语料库」
+countdown=4
+move=57,399,侧栏 语料库
+exec=powershell -NoProfile -ExecutionPolicy Bypass -File D:\AI\DeepSeekHarness\SelfHosting\_tools\mouse-cue\hit.ps1 -X 57 -Y 399
+wait=2400

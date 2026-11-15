@@ -1,0 +1,5 @@
+title=抗锯齿测试
+detail=细线双环与四向刻度
+countdown=2
+move=2700,780,预览点
+wait=5000

@@ -1,0 +1,6 @@
+title=鼠标操作预约器
+detail=倒计时结束后移动到屏幕右侧空白处并点击
+countdown=5
+move=1500,1200,屏幕右下空白
+click
+wait=700
