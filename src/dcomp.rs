@@ -1,155 +1,21 @@
-// 用 Windows.UI.Composition 在普通 HWND 上挂一棵视觉树，画两条横跨窗口的交叉线。
-// 走这条路不需要 SetLayeredWindowAttributes，也不需要 UpdateLayeredWindow：
-// 透明由合成器处理，线的粗细与长度可以逐帧改，全屏尺寸也不会像色键窗口那样画不出来。
+// 用 Windows.UI.Composition 在普通 HWND 上挂一棵视觉树，画两条交叉线。
+// 走合成器不需要色键或 UpdateLayeredWindow：透明由合成处理，全屏尺寸也能正常出图。
+//
+// 线用细矩形拼，不用 CompositionLineGeometry：后者没有起止点接口，
+// 而矩形几何与 SpriteShape 的组合已经验证可以稳定显示。
 
 use windows::core::Interface;
-use windows_numerics::Vector2;
+use windows::System::DispatcherQueueController;
 use windows::UI::Color;
-use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
+use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
-    Compositor, CompositionColorBrush, CompositionLineGeometry, CompositionSpriteShape, ContainerVisual,
+    Compositor, CompositionColorBrush, CompositionRectangleGeometry, CompositionSpriteShape, ContainerVisual,
     ShapeVisual,
 };
-use windows::System::DispatcherQueueController;
 use windows::Win32::Foundation::HWND;
+use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_SINGLETHREADED};
-
-
-pub struct MarkerSurface {
-    // 必须持有：DispatcherQueue 一销毁，合成器随之失效
-    _queue: DispatcherQueueController,
-    compositor: Compositor,
-    root: ContainerVisual,
-    shape: ShapeVisual,
-    brush: CompositionColorBrush,
-    horizontal: CompositionSpriteShape,
-    vertical: CompositionSpriteShape,
-    h_line: CompositionLineGeometry,
-    v_line: CompositionLineGeometry,
-}
-
-impl MarkerSurface {
-    /// 在 hwnd 上建立视觉树。失败时返回 None，调用方回退到旧画法。
-    pub fn attach(hwnd: isize) -> Option<Self> {
-        let hwnd = HWND(hwnd as *mut core::ffi::c_void);
-        // WinRT 合成器要求当前线程有 COM 与 DispatcherQueue
-        unsafe {
-            let _ = RoInitialize(RO_INIT_SINGLETHREADED);
-        }
-        let queue = queue_on_current_thread()?;
-        let compositor = match Compositor::new() {
-            Ok(value) => value,
-            Err(error) => {
-                eprintln!("dcomp: compositor failed: {}", error);
-                return None;
-            }
-        };
-
-        let interop: ICompositorDesktopInterop = match compositor.cast() {
-            Ok(value) => value,
-            Err(error) => {
-                eprintln!("dcomp: interop cast failed: {}", error);
-                return None;
-            }
-        };
-        let target = match unsafe { interop.CreateDesktopWindowTarget(hwnd, false) } {
-            Ok(value) => value,
-            Err(error) => {
-                eprintln!("dcomp: desktop target failed: {}", error);
-                return None;
-            }
-        };
-
-        let root = compositor.CreateContainerVisual().ok()?;
-        root.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 }).ok()?;
-        target.SetRoot(&root).ok()?;
-
-        let shape = compositor.CreateShapeVisual().ok()?;
-        shape.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 }).ok()?;
-        root.Children().ok()?.InsertAtTop(&shape).ok()?;
-
-        let brush = compositor
-            .CreateColorBrushWithColor(Color {
-                A: 255,
-                R: 242,
-                G: 242,
-                B: 242,
-            })
-            .ok()?;
-
-        let h_line = compositor.CreateLineGeometry().ok()?;
-        let v_line = compositor.CreateLineGeometry().ok()?;
-
-        let horizontal = compositor.CreateSpriteShapeWithGeometry(&h_line).ok()?;
-        horizontal.SetStrokeBrush(&brush).ok()?;
-        horizontal.SetFillBrush(&brush).ok()?;
-
-        let vertical = compositor.CreateSpriteShapeWithGeometry(&v_line).ok()?;
-        vertical.SetStrokeBrush(&brush).ok()?;
-        vertical.SetFillBrush(&brush).ok()?;
-
-        let shapes = shape.Shapes().ok()?;
-        shapes.Append(&horizontal).ok()?;
-        shapes.Append(&vertical).ok()?;
-
-        Some(Self {
-            _queue: queue,
-            compositor,
-            root,
-            shape,
-            brush,
-            horizontal,
-            vertical,
-            h_line,
-            v_line,
-        })
-    }
-
-    /// 逐帧更新：中心点用 DIP 坐标，half 是当前半长。
-    pub fn update(&self, cx: f32, cy: f32, half: f32, width: f32, pressed: bool) {
-        let color = if pressed {
-            Color {
-                A: 255,
-                R: 255,
-                G: 255,
-                B: 255,
-            }
-        } else {
-            Color {
-                A: 255,
-                R: 242,
-                G: 242,
-                B: 242,
-            }
-        };
-        let _ = self.brush.SetColor(color);
-        let _ = self
-            .h_line
-            .SetStart(Vector2 { X: cx - half, Y: cy });
-        let _ = self
-            .h_line
-            .SetEnd(Vector2 { X: cx + half, Y: cy });
-        let _ = self
-            .v_line
-            .SetStart(Vector2 { X: cx, Y: cy - half });
-        let _ = self
-            .v_line
-            .SetEnd(Vector2 { X: cx, Y: cy + half });
-        let _ = self.horizontal.SetStrokeThickness(width);
-        let _ = self.vertical.SetStrokeThickness(width);
-    }
-
-    pub fn set_visible(&self, visible: bool) {
-        let _ = self.shape.SetIsVisible(visible);
-    }
-
-    pub fn resize(&self, width: f32, height: f32) {
-        let _ = self.shape.SetSize(Vector2 {
-            X: width,
-            Y: height,
-        });
-    }
-}
+use windows_numerics::Vector2;
 
 #[repr(C)]
 struct DispatcherQueueOptions {
@@ -183,4 +49,144 @@ fn queue_on_current_thread() -> Option<DispatcherQueueController> {
         return None;
     }
     Some(unsafe { DispatcherQueueController::from_raw(raw as *mut core::ffi::c_void) })
+}
+
+pub struct MarkerSurface {
+    // 下面两个必须持有：队列一销毁合成器失效，目标一释放整棵树关闭
+    _queue: DispatcherQueueController,
+    _target: DesktopWindowTarget,
+    compositor: Compositor,
+    root: ContainerVisual,
+    shape: ShapeVisual,
+    brush: CompositionColorBrush,
+    h_geo: CompositionRectangleGeometry,
+    v_geo: CompositionRectangleGeometry,
+    h_sprite: CompositionSpriteShape,
+    v_sprite: CompositionSpriteShape,
+}
+
+impl MarkerSurface {
+    /// 在 hwnd 上建立视觉树。窗口需要是不带 layered 的普通窗口。
+    pub fn attach(hwnd: isize) -> Option<Self> {
+        let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+        unsafe {
+            let _ = RoInitialize(RO_INIT_SINGLETHREADED);
+        }
+        let queue = queue_on_current_thread()?;
+        let compositor = match Compositor::new() {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("dcomp: compositor failed: {}", error);
+                return None;
+            }
+        };
+        let interop: ICompositorDesktopInterop = match compositor.cast() {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("dcomp: interop cast failed: {}", error);
+                return None;
+            }
+        };
+        let target = match unsafe { interop.CreateDesktopWindowTarget(hwnd, false) } {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("dcomp: desktop target failed: {}", error);
+                return None;
+            }
+        };
+
+        let root = compositor.CreateContainerVisual().ok()?;
+        target.SetRoot(&root).ok()?;
+
+        let (sw, sh) = crate::screen_size();
+        let scale = crate::dpi_scale();
+        let shape = compositor.CreateShapeVisual().ok()?;
+        shape
+            .SetSize(Vector2 {
+                X: sw as f32 / scale,
+                Y: sh as f32 / scale,
+            })
+            .ok()?;
+        root.Children().ok()?.InsertAtTop(&shape).ok()?;
+
+        let brush = compositor
+            .CreateColorBrushWithColor(Color {
+                A: 255,
+                R: 242,
+                G: 242,
+                B: 242,
+            })
+            .ok()?;
+
+        let h_geo = compositor.CreateRectangleGeometry().ok()?;
+        let v_geo = compositor.CreateRectangleGeometry().ok()?;
+        let h_sprite = compositor.CreateSpriteShapeWithGeometry(&h_geo).ok()?;
+        let v_sprite = compositor.CreateSpriteShapeWithGeometry(&v_geo).ok()?;
+        h_sprite.SetFillBrush(&brush).ok()?;
+        v_sprite.SetFillBrush(&brush).ok()?;
+
+        let shapes = shape.Shapes().ok()?;
+        shapes.Append(&h_sprite).ok()?;
+        shapes.Append(&v_sprite).ok()?;
+
+        Some(Self {
+            _queue: queue,
+            _target: target,
+            compositor,
+            root,
+            shape,
+            brush,
+            h_geo,
+            v_geo,
+            h_sprite,
+            v_sprite,
+        })
+    }
+
+    /// 逐帧更新。中心点与半长都是 DIP，width 是线的粗细。
+    pub fn update(&self, cx: f32, cy: f32, half: f32, width: f32, pressed: bool) {
+        let color = if pressed {
+            Color {
+                A: 255,
+                R: 255,
+                G: 255,
+                B: 255,
+            }
+        } else {
+            Color {
+                A: 255,
+                R: 242,
+                G: 242,
+                B: 242,
+            }
+        };
+        let _ = self.brush.SetColor(color);
+        let w = 20.0; // 临时放大，验证是否只是太细
+        eprintln!(
+            "dcomp update cx={} cy={} half={} w={} size=({},{})",
+            cx, cy, half, w, half * 2.0, w
+        );
+
+        let _ = self.h_geo.SetSize(Vector2 {
+            X: (half * 2.0).max(1.0),
+            Y: w,
+        });
+        let _ = self.h_sprite.SetOffset(Vector2 {
+            X: cx - half,
+            Y: cy - w / 2.0,
+        });
+
+        let _ = self.v_geo.SetSize(Vector2 {
+            X: w,
+            Y: (half * 2.0).max(1.0),
+        });
+        let _ = self.v_sprite.SetOffset(Vector2 {
+            X: cx - w / 2.0,
+            Y: cy - half,
+        });
+    }
+
+    pub fn set_visible(&self, visible: bool) {
+        let _ = self.shape.SetIsVisible(visible);
+    }
 }
