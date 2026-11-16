@@ -5,7 +5,9 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
+mod config;
 mod dcomp;
+mod settings;
 
 use std::env;
 use std::fs;
@@ -1325,6 +1327,14 @@ fn main() {
         SetProcessDPIAware();
     }
     let args: Vec<String> = env::args().collect();
+
+    // 设置窗口：这一支不跑计划，只改配置
+    if args.iter().any(|arg| arg == "--settings") {
+        let mut current = config::Config::load();
+        let saved = settings::run(&mut current);
+        std::process::exit(if saved { 0 } else { 1 });
+    }
+
     if args.len() < 2 {
         eprintln!("用法: mouse-cue <plan.txt>  或  mouse-cue --demo");
         std::process::exit(1);
