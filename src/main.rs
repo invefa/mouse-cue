@@ -224,6 +224,7 @@ const WM_PAINT: u32 = 0x000F;
 const WM_TIMER: u32 = 0x0113;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_ERASEBKGND: u32 = 0x0014;
+const WM_NCHITTEST: u32 = 0x0084;
 
 const DT_LEFT: u32 = 0;
 const DT_RIGHT: u32 = 0x0000_0002;
@@ -882,7 +883,14 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
 
 unsafe extern "system" fn cue_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
     match msg {
+        // 全屏覆盖层必须让鼠标穿透：WS_EX_TRANSPARENT 对非 layered 窗口不可靠，
+        // 命中测试返回 HTTRANSPARENT 才能把点击与滚轮交还给下面的窗口。
+        WM_NCHITTEST => -1,
         WM_PAINT => {
+            // 挂了合成视觉树时内容由合成器负责，不走 BeginPaint，否则合成内容会被清掉
+            if st().surface.is_some() {
+                return 0;
+            }
             let mut paint: PAINTSTRUCT = std::mem::zeroed();
             let hdc = BeginPaint(hwnd, &mut paint);
             draw_cue(hwnd, hdc);
@@ -894,6 +902,14 @@ unsafe extern "system" fn cue_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
     }
 }
 
+fn hide_cue(hwnd: HWND) {
+    if hwnd != 0 {
+        unsafe {
+            ShowWindow(hwnd, 0); // SW_HIDE
+        }
+    }
+}
+
 fn cancel() {
     let state = st();
     if state.phase == 3 || state.phase == 2 {
@@ -901,6 +917,8 @@ fn cancel() {
     }
     state.phase = 3;
     state.exit_code = 2;
+    // 全屏覆盖层一结束就撤掉，避免它继续挡鼠标
+    hide_cue(state.cue);
     state.done_until = Instant::now() + Duration::from_millis(700);
     invalidate(state.main);
 }
