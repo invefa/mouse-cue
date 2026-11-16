@@ -5,6 +5,8 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
+mod dcomp;
+
 use std::env;
 use std::fs;
 use std::time::{Duration, Instant};
@@ -292,6 +294,8 @@ struct State {
     dpi: f32,
     exit_code: i32,
     last_label: String,
+    surface: Option<dcomp::MarkerSurface>,
+    last_push: Option<(f32, f32, f32, f32, bool)>,
 }
 
 static mut STATE: Option<State> = None;
@@ -310,7 +314,11 @@ fn scale(dpi: f32, value: i32) -> i32 {
     (value as f32 * dpi).round() as i32
 }
 
-fn screen_size() -> (i32, i32) {
+pub(crate) fn dpi_scale() -> f32 {
+    unsafe { (GetDpiForSystem() as f32) / 96.0 }
+}
+
+pub(crate) fn screen_size() -> (i32, i32) {
     unsafe { (GetSystemMetrics(0), GetSystemMetrics(1)) }
 }
 
@@ -506,45 +514,19 @@ fn pick_colors(x: i32, y: i32) -> (u32, u32) {
 /// 把落点标记放到目标处。animate 为真时从三倍尺寸收缩到定尺。
 fn place_cue(x: i32, y: i32, animate: bool) {
     let state = st();
-    let size = scale(state.dpi, 320);
-    let target = scale(state.dpi, 34) as f32;
-    state.cue_at = (x, y);
-    state.cue_to = target;
-    state.cue_from = if animate { target * 3.2 } else { target };
+    // 标记窗口固定铺满整屏，原点在 (1,1)，窗口内坐标即屏幕坐标减一
+    let (sw, _sh) = screen_size();
+    let start = sw as f32 / 2.0;
+    let end = scale(state.dpi, 40) as f32;
+    state.cue_at = (x - 1, y - 1);
+    state.cue_to = end;
+    state.cue_from = if animate { start } else { end };
     state.cue_radius = state.cue_from;
     state.cue_started = Instant::now();
     unsafe {
-        SetWindowPos(
-            state.cue,
-            HWND_TOPMOST,
-            x - size / 2,
-            y - size / 2,
-            size,
-            size,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
-    }
-    unsafe {
         ShowWindow(state.cue, SW_SHOWNOACTIVATE);
-        UpdateWindow(state.cue);
     }
-    invalidate(state.cue);
-    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-    unsafe {
-        GetWindowRect(state.cue, &mut wr);
-    }
-    eprintln!(
-        "cue placed ({},{}) size={} visible={} rect=({},{})-({},{}) r={:.1}",
-        x,
-        y,
-        size,
-        unsafe { IsWindowVisible(state.cue) },
-        wr.left,
-        wr.top,
-        wr.right,
-        wr.bottom,
-        state.cue_radius
-    );
+    push_surface(state);
 }
 
 /// 推进收缩动画；返回是否仍在动。
@@ -799,6 +781,9 @@ fn gp_line(g: isize, x1: f32, y1: f32, x2: f32, y2: f32, width: f32, argb: u32) 
 // 落点标记：圆里一个加号。圆用半透明灰填充，轮廓与加号都走双色描边
 // （外深内浅），这样在深色与浅色背景上都能分开，不用逐像素反色。
 fn draw_cue(hwnd: HWND, hdc: HDC) {
+    if st().surface.is_some() {
+        return;
+    }
     let state = st();
     let radius = state.cue_radius;
     if radius < 1.0 {
@@ -920,6 +905,42 @@ fn cancel() {
     invalidate(state.main);
 }
 
+/// 每帧把几何推给合成视觉树，坐标从物理像素换成 DIP。
+fn push_surface(state: &mut State) {
+    let surface = match &state.surface {
+        Some(value) => value,
+        None => return,
+    };
+    let scale = state.dpi;
+    let ratio = (state.cue_radius / state.cue_from.max(1.0)).clamp(0.0, 1.0);
+    let key = (
+        state.cue_at.0 as f32 / scale,
+        state.cue_at.1 as f32 / scale,
+        state.cue_radius / scale,
+        (1.0 + 2.0 * ratio) / scale,
+        state.cue_pressed,
+    );
+    // 值没变就不重建，避免每帧 Clear 把末态刷掉
+    if let Some(last) = state.last_push {
+        if (last.0 - key.0).abs() < 0.05
+            && (last.1 - key.1).abs() < 0.05
+            && (last.2 - key.2).abs() < 0.05
+            && (last.3 - key.3).abs() < 0.02
+            && last.4 == key.4
+        {
+            return;
+        }
+    }
+    state.last_push = Some(key);
+    surface.update(
+        state.cue_at.0 as f32 / scale,
+        state.cue_at.1 as f32 / scale,
+        state.cue_radius / scale,
+        ((1.0 + 2.0 * ratio) / scale).max(1.4),
+        state.cue_pressed,
+    );
+}
+
 fn tick() {
     let state = st();
     let now = Instant::now();
@@ -934,6 +955,7 @@ fn tick() {
         }
     }
     step_cue_animation();
+    push_surface(st());
 
     match state.phase {
         0 => {
@@ -1158,14 +1180,26 @@ fn run(plan: Plan, cancel_after: Option<u64>) -> i32 {
         let cue = create_window(
             "MouseCueRing",
             "mouse-cue-ring",
-            WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            cue_size,
-            cue_size,
-            -1000,
-            -1000,
+            WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | 0x0020_0000,
+            screen_size().0 - 2,
+            screen_size().1 - 2,
+            1,
+            1,
             cue_proc as usize,
             false,
         );
+
+        // 合成视觉树接管标记绘制
+        let surface = match dcomp::MarkerSurface::attach(cue) {
+            Some(value) => {
+                eprintln!("dcomp: surface ready");
+                Some(value)
+            }
+            None => {
+                eprintln!("dcomp: attach failed, falling back to gdi");
+                None
+            }
+        };
 
         let started = Instant::now();
         let countdown_until = started + Duration::from_secs(plan.countdown);
@@ -1210,6 +1244,8 @@ fn run(plan: Plan, cancel_after: Option<u64>) -> i32 {
             dpi,
             exit_code: 0,
             last_label: String::new(),
+            surface,
+            last_push: None,
         });
 
         ShowWindow(main, SW_SHOWNOACTIVATE);

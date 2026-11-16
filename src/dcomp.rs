@@ -1,16 +1,19 @@
 // 用 Windows.UI.Composition 在普通 HWND 上挂一棵视觉树，画两条交叉线。
 // 走合成器不需要色键或 UpdateLayeredWindow：透明由合成处理，全屏尺寸也能正常出图。
 //
-// 线用细矩形拼，不用 CompositionLineGeometry：后者没有起止点接口，
-// 而矩形几何与 SpriteShape 的组合已经验证可以稳定显示。
+// 线用细矩形拼，不用 CompositionLineGeometry：后者没有起止点接口。
+// 每帧重建 geometry 与 sprite：预建对象上改 SetSize/SetOffset 实测不重绘，
+// 一次只画两条线，重建的开销可以接受。
+
+use std::cell::RefCell;
 
 use windows::core::Interface;
 use windows::System::DispatcherQueueController;
 use windows::UI::Color;
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
-    Compositor, CompositionColorBrush, CompositionRectangleGeometry, CompositionSpriteShape, ContainerVisual,
-    ShapeVisual,
+    Compositor, CompositionColorBrush, CompositionRectangleGeometry, CompositionShapeCollection,
+    CompositionSpriteShape, ContainerVisual, ShapeVisual,
 };
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
@@ -58,11 +61,11 @@ pub struct MarkerSurface {
     compositor: Compositor,
     root: ContainerVisual,
     shape: ShapeVisual,
+    shapes: CompositionShapeCollection,
     brush: CompositionColorBrush,
-    h_geo: CompositionRectangleGeometry,
-    v_geo: CompositionRectangleGeometry,
-    h_sprite: CompositionSpriteShape,
-    v_sprite: CompositionSpriteShape,
+    // 必须持有当前这帧与上一帧用到的 geometry 与 sprite：
+    // 它们是 COM 对象，一旦引用归零就被关闭，合成器随即丢弃画面。
+    alive: RefCell<Vec<(CompositionRectangleGeometry, CompositionSpriteShape)>>,
 }
 
 impl MarkerSurface {
@@ -117,17 +120,7 @@ impl MarkerSurface {
                 B: 242,
             })
             .ok()?;
-
-        let h_geo = compositor.CreateRectangleGeometry().ok()?;
-        let v_geo = compositor.CreateRectangleGeometry().ok()?;
-        let h_sprite = compositor.CreateSpriteShapeWithGeometry(&h_geo).ok()?;
-        let v_sprite = compositor.CreateSpriteShapeWithGeometry(&v_geo).ok()?;
-        h_sprite.SetFillBrush(&brush).ok()?;
-        v_sprite.SetFillBrush(&brush).ok()?;
-
         let shapes = shape.Shapes().ok()?;
-        shapes.Append(&h_sprite).ok()?;
-        shapes.Append(&v_sprite).ok()?;
 
         Some(Self {
             _queue: queue,
@@ -135,55 +128,48 @@ impl MarkerSurface {
             compositor,
             root,
             shape,
+            shapes,
             brush,
-            h_geo,
-            v_geo,
-            h_sprite,
-            v_sprite,
+            alive: RefCell::new(Vec::new()),
         })
     }
 
-    /// 逐帧更新。中心点与半长都是 DIP，width 是线的粗细。
+    /// 逐帧重建两条线。中心点、半长与粗细都是 DIP 单位。
     pub fn update(&self, cx: f32, cy: f32, half: f32, width: f32, pressed: bool) {
-        let color = if pressed {
-            Color {
+        if pressed {
+            let _ = self.brush.SetColor(Color {
                 A: 255,
                 R: 255,
                 G: 255,
                 B: 255,
-            }
-        } else {
-            Color {
-                A: 255,
-                R: 242,
-                G: 242,
-                B: 242,
-            }
+            });
+        }
+        let w = width.clamp(0.8, 40.0);
+        let _ = self.shapes.Clear();
+        self.alive.borrow_mut().clear();
+
+        self.push_bar(cx - half, cy - w / 2.0, half * 2.0, w);
+        self.push_bar(cx - w / 2.0, cy - half, w, half * 2.0);
+    }
+
+    fn push_bar(&self, x: f32, y: f32, w: f32, h: f32) {
+        let geo = match self.compositor.CreateRectangleGeometry() {
+            Ok(value) => value,
+            Err(_) => return,
         };
-        let _ = self.brush.SetColor(color);
-        let w = 20.0; // 临时放大，验证是否只是太细
-        eprintln!(
-            "dcomp update cx={} cy={} half={} w={} size=({},{})",
-            cx, cy, half, w, half * 2.0, w
-        );
+        let _ = geo.SetSize(Vector2 { X: w.max(1.0), Y: h.max(1.0) });
+        let sprite: CompositionSpriteShape = match self.compositor.CreateSpriteShapeWithGeometry(&geo) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let _ = sprite.SetOffset(Vector2 { X: x, Y: y });
+        let _ = sprite.SetFillBrush(&self.brush);
+        let _ = self.shapes.Append(&sprite);
+        self.alive.borrow_mut().push((geo, sprite));
+    }
 
-        let _ = self.h_geo.SetSize(Vector2 {
-            X: (half * 2.0).max(1.0),
-            Y: w,
-        });
-        let _ = self.h_sprite.SetOffset(Vector2 {
-            X: cx - half,
-            Y: cy - w / 2.0,
-        });
-
-        let _ = self.v_geo.SetSize(Vector2 {
-            X: w,
-            Y: (half * 2.0).max(1.0),
-        });
-        let _ = self.v_sprite.SetOffset(Vector2 {
-            X: cx - w / 2.0,
-            Y: cy - half,
-        });
+    pub fn debug_rect(&self, x: f32, y: f32, w: f32, h: f32) {
+        self.push_bar(x, y, w, h);
     }
 
     pub fn set_visible(&self, visible: bool) {
